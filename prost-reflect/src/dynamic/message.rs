@@ -10,6 +10,7 @@ use crate::{
 };
 
 use super::{
+    decode_options::DecodeOptions,
     fields::{FieldDescriptorLike, ValueAndDescriptor},
     unknown::UnknownField,
 };
@@ -42,21 +43,7 @@ impl Message for DynamicMessage {
     where
         Self: Sized,
     {
-        if let Some(field_desc) = self.desc.get_field(number) {
-            self.get_field_mut(&field_desc)
-                .merge_field(&field_desc, wire_type, buf, ctx)
-        } else if let Some(extension_desc) = self.desc.get_extension(number) {
-            self.get_extension_mut(&extension_desc).merge_field(
-                &extension_desc,
-                wire_type,
-                buf,
-                ctx,
-            )
-        } else {
-            let field = UnknownField::decode_value(number, wire_type, buf, ctx)?;
-            self.fields.add_unknown(number, field);
-            Ok(())
-        }
+        self.merge_field_with_options(number, wire_type, buf, ctx, &DecodeOptions::default())
     }
 
     fn encoded_len(&self) -> usize {
@@ -77,6 +64,69 @@ impl Message for DynamicMessage {
 
     fn clear(&mut self) {
         self.fields.clear_all();
+    }
+}
+
+impl DynamicMessage {
+    pub(super) fn merge_field_with_options(
+        &mut self,
+        number: u32,
+        wire_type: WireType,
+        buf: &mut impl Buf,
+        ctx: DecodeContext,
+        options: &DecodeOptions,
+    ) -> Result<(), DecodeError> {
+        if let Some(field_desc) = self.desc.get_field(number) {
+            self.get_field_mut(&field_desc)
+                .merge_field(&field_desc, wire_type, buf, ctx, options)
+        } else if let Some(extension_desc) = self.desc.get_extension(number) {
+            self.get_extension_mut(&extension_desc).merge_field(
+                &extension_desc,
+                wire_type,
+                buf,
+                ctx,
+                options,
+            )
+        } else if options.ignore_unknown_fields {
+            prost::encoding::skip_field(wire_type, number, buf, ctx)
+        } else {
+            let field = UnknownField::decode_value(number, wire_type, buf, ctx)?;
+            self.fields.add_unknown(number, field);
+            Ok(())
+        }
+    }
+}
+
+/// Adapter used to thread [`DecodeOptions`] through prost's nested message decoding, which only
+/// knows how to call [`Message::merge_field`].
+#[derive(Debug)]
+struct MergeWithOptions<'a> {
+    message: &'a mut DynamicMessage,
+    options: &'a DecodeOptions,
+}
+
+impl Message for MergeWithOptions<'_> {
+    fn encode_raw(&self, _: &mut impl BufMut) {
+        unreachable!("MergeWithOptions is only used for decoding")
+    }
+
+    fn merge_field(
+        &mut self,
+        number: u32,
+        wire_type: WireType,
+        buf: &mut impl Buf,
+        ctx: DecodeContext,
+    ) -> Result<(), DecodeError> {
+        self.message
+            .merge_field_with_options(number, wire_type, buf, ctx, self.options)
+    }
+
+    fn encoded_len(&self) -> usize {
+        unreachable!("MergeWithOptions is only used for decoding")
+    }
+
+    fn clear(&mut self) {
+        unreachable!("MergeWithOptions is only used for decoding")
     }
 }
 
@@ -275,6 +325,7 @@ impl Value {
         wire_type: WireType,
         buf: &mut B,
         ctx: DecodeContext,
+        options: &DecodeOptions,
     ) -> Result<(), DecodeError>
     where
         B: Buf,
@@ -330,22 +381,33 @@ impl Value {
             }
             (Value::Message(message), Kind::Message(_)) => {
                 if field_desc.is_group() {
-                    prost::encoding::group::merge(field_desc.number(), wire_type, message, buf, ctx)
+                    prost::encoding::group::merge(
+                        field_desc.number(),
+                        wire_type,
+                        &mut MergeWithOptions { message, options },
+                        buf,
+                        ctx,
+                    )
                 } else {
-                    prost::encoding::message::merge(wire_type, message, buf, ctx)
+                    prost::encoding::message::merge(
+                        wire_type,
+                        &mut MergeWithOptions { message, options },
+                        buf,
+                        ctx,
+                    )
                 }
             }
             (Value::List(values), field_kind) if field_desc.is_list() => {
                 if wire_type == WireType::LengthDelimited && field_desc.is_packable() {
                     prost::encoding::merge_loop(values, buf, ctx, |values, buf, ctx| {
                         let mut value = Value::default_value(&field_kind);
-                        value.merge_field(field_desc, field_kind.wire_type(), buf, ctx)?;
+                        value.merge_field(field_desc, field_kind.wire_type(), buf, ctx, options)?;
                         values.push(value);
                         Ok(())
                     })
                 } else {
                     let mut value = Value::default_value(&field_kind);
-                    value.merge_field(field_desc, wire_type, buf, ctx)?;
+                    value.merge_field(field_desc, wire_type, buf, ctx, options)?;
                     values.push(value);
                     Ok(())
                 }
@@ -365,7 +427,7 @@ impl Value {
                         match number {
                             MAP_ENTRY_KEY_NUMBER => key.merge_field(&key_desc, wire_type, buf, ctx),
                             MAP_ENTRY_VALUE_NUMBER => {
-                                value.merge_field(&value_desc, wire_type, buf, ctx)
+                                value.merge_field(&value_desc, wire_type, buf, ctx, options)
                             }
                             _ => prost::encoding::skip_field(wire_type, number, buf, ctx),
                         }

@@ -6,7 +6,7 @@ use std::{
 
 use proptest::{prelude::*, test_runner::TestCaseError};
 use prost::{bytes::Bytes, encoding::WireType, Message};
-use prost_reflect::{DynamicMessage, MapKey, ReflectMessage, Value};
+use prost_reflect::{DecodeOptions, DynamicMessage, MapKey, ReflectMessage, Value};
 use prost_types::FileDescriptorSet;
 
 use crate::{
@@ -786,6 +786,32 @@ fn unknown_fields_are_roundtripped() {
     assert!(message.take_unknown_fields().eq(unknown_fields));
     assert!(message.encode_to_vec().is_empty());
     assert_eq!(message.unknown_fields().count(), 0);
+}
+
+#[test]
+fn ignore_unknown_fields_skips_nested_unknown_fields() {
+    // ComplexType { nested: Scalars { int32: 3, <unknown 100> }, <unknown 100> }
+    const BYTES: &[u8] = b"\x1a\x05\x18\x03\xa0\x06\x01\xa0\x06\x01";
+    let desc = test_file_descriptor()
+        .get_message_by_name("test.ComplexType")
+        .unwrap();
+
+    let kept = DynamicMessage::decode(desc.clone(), BYTES).unwrap();
+    assert_eq!(kept.unknown_fields().count(), 1);
+    assert_eq!(kept.encode_to_vec(), BYTES);
+
+    let skipped = DynamicMessage::decode_with_options(
+        desc,
+        BYTES,
+        DecodeOptions::new().ignore_unknown_fields(true),
+    )
+    .unwrap();
+    assert_eq!(skipped.unknown_fields().count(), 0);
+    let nested = skipped.get_field_by_name("nested").unwrap();
+    let nested = nested.as_message().unwrap();
+    assert_eq!(nested.unknown_fields().count(), 0);
+    assert_eq!(nested.get_field_by_name("int32").unwrap().as_i32(), Some(3));
+    assert_eq!(skipped.encode_to_vec(), b"\x1a\x02\x18\x03");
 }
 
 #[test]

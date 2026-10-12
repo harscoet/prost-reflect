@@ -6,6 +6,7 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "text-format")))]
 pub mod text_format;
 
+mod decode_options;
 mod fields;
 mod message;
 #[cfg(feature = "serde")]
@@ -16,6 +17,7 @@ mod unknown;
 
 use std::{borrow::Cow, collections::HashMap, error::Error, fmt};
 
+pub use self::decode_options::DecodeOptions;
 #[cfg(feature = "serde")]
 pub use self::serde::{DeserializeOptions, SerializeOptions};
 pub use self::unknown::UnknownField;
@@ -137,6 +139,54 @@ impl DynamicMessage {
         let mut message = DynamicMessage::new(desc);
         message.merge(buf)?;
         Ok(message)
+    }
+
+    /// Like [`decode()`](DynamicMessage::decode), but with the given [`DecodeOptions`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use prost_types::FileDescriptorSet;
+    /// # use prost_reflect::{DynamicMessage, DecodeOptions, DescriptorPool, Value};
+    /// # let pool = DescriptorPool::decode(include_bytes!("../file_descriptor_set.bin").as_ref()).unwrap();
+    /// # let message_descriptor = pool.get_message_by_name("package.MyMessage").unwrap();
+    /// // Field 15 is not declared by the message, and is skipped.
+    /// let dynamic_message = DynamicMessage::decode_with_options(
+    ///     message_descriptor,
+    ///     b"\x08\x96\x01\x78\x01".as_ref(),
+    ///     DecodeOptions::new().ignore_unknown_fields(true),
+    /// ).unwrap();
+    /// assert_eq!(dynamic_message.get_field_by_name("foo").unwrap().as_ref(), &Value::I32(150));
+    /// assert_eq!(dynamic_message.unknown_fields().count(), 0);
+    /// ```
+    pub fn decode_with_options<B>(
+        desc: MessageDescriptor,
+        buf: B,
+        options: DecodeOptions,
+    ) -> Result<Self, DecodeError>
+    where
+        B: Buf,
+    {
+        let mut message = DynamicMessage::new(desc);
+        message.merge_with_options(buf, &options)?;
+        Ok(message)
+    }
+
+    /// Like [`merge()`](prost::Message::merge), but with the given [`DecodeOptions`].
+    pub fn merge_with_options<B>(
+        &mut self,
+        mut buf: B,
+        options: &DecodeOptions,
+    ) -> Result<(), DecodeError>
+    where
+        B: Buf,
+    {
+        let ctx = prost::encoding::DecodeContext::default();
+        while buf.has_remaining() {
+            let (number, wire_type) = prost::encoding::decode_key(&mut buf)?;
+            self.merge_field_with_options(number, wire_type, &mut buf, ctx.clone(), options)?;
+        }
+        Ok(())
     }
 
     /// Returns `true` if this message has the given field set.
